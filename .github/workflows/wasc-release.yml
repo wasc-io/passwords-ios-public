@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       build-number:
-        description: "CFBundleVersion override (default: run number + 100)"
+        description: "CFBundleVersion override (default: run number * 10 + run attempt + 100)"
         type: string
       upload:
         description: "Upload to TestFlight (off = export the .ipa as an artifact only)"
@@ -91,13 +91,48 @@ jobs:
           chmod 600 "$key_path"
           echo "_ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
+      # altool on Xcode 26 can upload to the wrong app or fail silently without --apple-id,
+      # so resolve the numeric App Store Connect app id up front (and fail before archiving).
+      - name: Resolve App Store Connect app id
+        if: env._UPLOAD == 'true'
+        env:
+          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          _BUNDLE_ID: me.wasc.passwords
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --quiet --break-system-packages "pyjwt[crypto]"
+          python3 - <<'EOF'
+          import json, os, time, urllib.parse, urllib.request
+          import jwt
+
+          now = int(time.time())
+          token = jwt.encode(
+              {"iss": os.environ["_ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+              os.environ["_ASC_KEY_P8"],
+              algorithm="ES256",
+              headers={"kid": os.environ["_ASC_KEY_ID"], "typ": "JWT"},
+          )
+          bundle_id = os.environ["_BUNDLE_ID"]
+          url = "https://api.appstoreconnect.apple.com/v1/apps?" + urllib.parse.urlencode({"filter[bundleId]": bundle_id})
+          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+          with urllib.request.urlopen(req) as resp:
+              apps = [a for a in json.load(resp)["data"] if a["attributes"]["bundleId"] == bundle_id]
+          if not apps:
+              print(f"::error::No App Store Connect app record for {bundle_id}. Create it first (see wasc/README.md).")
+              raise SystemExit(1)
+          print(f"App Store Connect app {apps[0]['attributes']['name']} has id {apps[0]['id']}")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"_ASC_APP_ID={apps[0]['id']}\n")
+          EOF
+
       - name: Configure version, signing and plists
         run: |
           set -euo pipefail
           upstream_tag=$(tr -d '[:space:]' < wasc/upstream-tag)
           version_name=${upstream_tag#v}
           version_name=${version_name%-bwpm}
-          build_number=${_BUILD_NUMBER_INPUT:-$((GITHUB_RUN_NUMBER + 100))}
+          # Unique per run and per re-run attempt.
+          build_number=${_BUILD_NUMBER_INPUT:-$((GITHUB_RUN_NUMBER * 10 + GITHUB_RUN_ATTEMPT + 100))}
           echo "Version $version_name ($build_number) from $upstream_tag"
           echo "_VERSION_NAME=$version_name" >> "$GITHUB_ENV"
           echo "_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
@@ -105,13 +140,17 @@ jobs:
           yq -i ".settings.MARKETING_VERSION = \"$version_name\"" project-pm.yml
           yq -i ".settings.CURRENT_PROJECT_VERSION = \"$build_number\"" project-pm.yml
 
-          # Local-bwpm.xcconfig is included after wasc/wasc-bwpm.xcconfig, so it wins.
+          # Local-bwpm.xcconfig is included after wasc/wasc-bwpm.xcconfig and after the
+          # CODE_SIGN_IDENTITY = Apple Development line of Configs/Bitwarden-Release.xcconfig,
+          # so it wins: the archive is signed for distribution.
           cat > Configs/Local-bwpm.xcconfig <<EOF
           DEVELOPMENT_TEAM = $_APPLE_TEAM_ID
           CODE_SIGN_STYLE = Automatic
+          CODE_SIGN_IDENTITY = Apple Distribution
           EOF
 
-          # Production APNs (the passwords-push relay sends to api.push.apple.com).
+          # Production APNs (the passwords-push relay sends to api.push.apple.com). This matches
+          # the App Store distribution profile the archive is signed with.
           plutil -replace aps-environment -string production Bitwarden/Application/Support/Bitwarden.entitlements
 
           # Bitwarden's own export compliance code must not be shipped. Ours is optional.
@@ -188,10 +227,12 @@ jobs:
       - name: Upload to TestFlight
         if: env._UPLOAD == 'true'
         run: |
+          set -euo pipefail
           ipa=$(find build/export -maxdepth 1 -name '*.ipa' | head -n 1)
           xcrun altool --upload-app \
             --type ios \
             --file "$ipa" \
+            --apple-id "$_ASC_APP_ID" \
             --apiKey "$_ASC_KEY_ID" \
             --apiIssuer "$_ASC_ISSUER_ID"
 
