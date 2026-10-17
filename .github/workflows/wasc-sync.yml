@@ -85,8 +85,9 @@ jobs:
               raise SystemExit(0)
           builds = get("/v1/builds", **{"filter[app]": apps[0]["id"], "sort": "-uploadedDate", "limit": "1"})["data"]
           if not builds:
-              print("::warning::No builds uploaded yet.")
-              out.write("stale=true\n")
+              # Nothing to keep alive yet; the first build is dispatched by hand.
+              print("::warning::No builds uploaded yet; skipping.")
+              out.write("stale=false\n")
               raise SystemExit(0)
           uploaded = datetime.datetime.fromisoformat(builds[0]["attributes"]["uploadedDate"])
           age = (datetime.datetime.now(datetime.timezone.utc) - uploaded).days
@@ -99,7 +100,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "::warning::Newest TestFlight build is older than $_MAX_AGE_DAYS days (or missing); dispatching wasc-release.yml"
+          echo "::warning::Newest TestFlight build is $_MAX_AGE_DAYS+ days old; dispatching wasc-release.yml"
           gh workflow run wasc-release.yml -R "$GITHUB_REPOSITORY" --ref wasc
 
   sync:
@@ -162,11 +163,15 @@ jobs:
           else
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
             git diff --name-only --diff-filter=U | tee "$RUNNER_TEMP/conflicts.txt"
+            # The fork's placeholder icons are binary; always keep ours.
+            if git checkout --ours -- '*Icon-1024.png' 2>/dev/null; then
+              git add -- '*Icon-1024.png' || true
+            fi
           fi
 
       - name: Resolve conflicts with Claude
         if: steps.merge.outputs.conflicts == 'true'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1.0.252
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
@@ -180,7 +185,7 @@ jobs:
             Finish with a short summary of what you resolved.
           claude_args: >-
             --max-turns 60
-            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git log:*),Bash(git show:*)"
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git log:*),Bash(git show:*),Bash(git checkout:*),Bash(git rm:*)"
 
       - name: Commit, push and open PR
         if: steps.find.outputs.tag != ''
@@ -263,7 +268,7 @@ jobs:
 
       - name: Fix build with Claude
         if: steps.build.outputs.ok == 'false'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1.0.252
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
@@ -291,6 +296,9 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The build regenerates the acknowledgements in Settings.bundle; that is noise, not a fix.
+          git checkout -- '*/Settings.bundle' 2>/dev/null || true
+          git clean -fdq -- '*/Settings.bundle'
           if [ -z "$(git status --porcelain)" ]; then
             gh pr comment "$_BRANCH" --body "Simulator build failed and Claude made no changes. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             exit 1
