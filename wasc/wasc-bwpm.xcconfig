@@ -1,0 +1,13 @@
+// wasc passwords overrides for the Password Manager targets.
+// Included at the end of Configs/Common-bwpm.xcconfig, so it wins over upstream
+// defaults while Configs/Local-bwpm.xcconfig (written by CI / developers) still wins over this.
+
+// Empty on purpose: CI writes the team into Configs/Local-bwpm.xcconfig from the APPLE_TEAM_ID secret.
+DEVELOPMENT_TEAM =
+ORGANIZATION_IDENTIFIER = me.wasc
+BASE_BUNDLE_ID = me.wasc.passwords
+SHARED_APP_GROUP_IDENTIFIER = group.me.wasc.passwords.authenticator
+BMPW_BUNDLE_DISPLAY_NAME = wasc passwords
+
+// Disables Firebase/Crashlytics in Release (see ErrorReporterFactory.swift / ExtensionDelegate.swift).
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) WASC_NO_CRASHLYTICS

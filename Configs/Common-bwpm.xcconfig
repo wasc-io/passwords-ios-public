@@ -27,3 +27,6 @@ BMPW_BUNDLE_DISPLAY_NAME = Bitwarden
 // This should allow Xcode to build the application based on these settings without
 // code signing errors or having to modify the project itself.
 //
+
+// wasc passwords: fork identifiers (must stay last so Local-bwpm.xcconfig can still override them).
+#include "../wasc/wasc-bwpm.xcconfig"
