@@ -7,7 +7,7 @@ enum ErrorReporterFactory {
 
     /// Creates the default error reporter.
     static func makeDefaultErrorReporter() -> ErrorReporter {
-        #if DEBUG
+        #if DEBUG || WASC_NO_CRASHLYTICS
         OSLogErrorReporter()
         #else
         CrashlyticsErrorReporter.shared
