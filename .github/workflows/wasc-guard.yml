@@ -1,0 +1,33 @@
+name: wasc guard
+
+# Disables every workflow whose file is not .github/workflows/wasc-*. Upstream workflows need
+# Bitwarden's secrets, and every upstream merge can bring new ones, which GitHub enables on arrival.
+# Runs on every push to wasc (for example a merged sync PR), on demand, and from wasc-sync.yml
+# (daily, and again right after it pushes a sync/<tag> branch). See wasc/README.md.
+
+on:
+  push:
+    branches: [wasc]
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  disable:
+    name: Disable non-wasc workflows
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Disable active workflows that are not wasc-*
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | select(.path | startswith(".github/workflows/wasc-") | not) | "\(.id) \(.path)"' |
+          while read -r id path; do
+            echo "Disabling $path"
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+          done

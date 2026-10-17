@@ -1,7 +1,8 @@
 name: wasc upstream sync
 
 # Daily:
-#   1. keeps every non-wasc workflow disabled (upstream workflows need Bitwarden's Azure secrets),
+#   0. re-enables itself, so GitHub's 60-day inactivity rule never pauses the schedule,
+#   1. keeps every non-wasc workflow disabled (wasc-guard.yml; upstream workflows need Bitwarden's secrets),
 #   2. re-runs wasc-release.yml when the newest TestFlight build is about to expire,
 #   3. merges the newest upstream Password Manager tag (v*-bwpm) into a sync/<tag> branch,
 #      lets Claude resolve conflicts / build breaks, and opens a PR against `wasc`.
@@ -20,31 +21,35 @@ concurrency:
   group: wasc-sync
   cancel-in-progress: false
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  disable-upstream-workflows:
-    name: Disable upstream workflows
+  keepalive:
+    # GitHub disables scheduled workflows in public repos after 60 days without repository
+    # activity, and this schedule is what keeps TestFlight builds from expiring (90 days).
+    # Re-enabling an active workflow resets that timer; this is what liskin/gh-workflow-keepalive
+    # (v1.2.1, f72ff1a1) does, inlined here instead of pulling in another action. No commits.
+    name: Keep schedule alive
     runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
-      - name: Disable active workflows that are not wasc-*
+      - name: Re-enable wasc-sync.yml
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
-            --jq '.workflows[] | select(.state == "active") | select(.path | startswith(".github/workflows/wasc-") | not) | "\(.id) \(.path)"' |
-          while read -r id path; do
-            echo "Disabling $path"
-            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
-          done
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/wasc-sync.yml/enable"
+
+  disable-upstream-workflows:
+    name: Disable upstream workflows
+    permissions:
+      actions: write
+    uses: ./.github/workflows/wasc-guard.yml
 
   stale-check:
     name: TestFlight build freshness
     runs-on: ubuntu-24.04
     permissions:
+      contents: read
       actions: write
     env:
       _ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -129,10 +134,16 @@ jobs:
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/bitwarden/ios.git
-          git fetch --quiet --no-tags upstream '+refs/tags/v*-bwpm:refs/tags/v*-bwpm'
+          # Upstream tags go to their own namespace, never refs/tags, so they cannot clash with
+          # (or overwrite) the fork's own tags such as wasc-v*.
+          git fetch --quiet --no-tags upstream '+refs/tags/v*-bwpm:refs/upstream-tags/v*-bwpm'
           current=$(tr -d '[:space:]' < wasc/upstream-tag)
-          latest=${_TAG_INPUT:-$(git tag -l 'v*-bwpm' | sort -V | tail -n 1)}
+          latest=${_TAG_INPUT:-$(git for-each-ref --format='%(refname:lstrip=2)' 'refs/upstream-tags/v*-bwpm' | sort -V | tail -n 1)}
           echo "current=$current latest=$latest"
+          if ! git rev-parse --verify --quiet "refs/upstream-tags/$latest^{commit}" > /dev/null; then
+            echo "::error::Upstream has no tag $latest matching v*-bwpm"
+            exit 1
+          fi
           if [ "$latest" = "$current" ] || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)" = "$current" ]; then
             echo "Up to date."
             exit 0
@@ -158,7 +169,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$_BRANCH"
-          if git merge --no-edit --no-ff "$_TAG"; then
+          if git merge --no-ff -m "Merge upstream tag $_TAG" "refs/upstream-tags/$_TAG"; then
             echo "conflicts=false" >> "$GITHUB_OUTPUT"
           else
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
@@ -190,6 +201,8 @@ jobs:
       - name: Commit, push and open PR
         if: steps.find.outputs.tag != ''
         env:
+          # The repo does not let GITHUB_TOKEN create (or approve) PRs, so opening the PR needs
+          # WASC_SYNC_TOKEN. Without it the branch is still pushed and a compare link is logged.
           GH_TOKEN: ${{ secrets.WASC_SYNC_TOKEN || github.token }}
           _TAG: ${{ steps.find.outputs.tag }}
           _CURRENT: ${{ steps.find.outputs.current }}
@@ -213,12 +226,23 @@ jobs:
           if [ "$_CONFLICTS" = "true" ]; then
             note="Conflicts were resolved by Claude: $(tr '\n' ' ' < "$RUNNER_TEMP/conflicts.txt"). Review them carefully."
           fi
-          gh pr create --base wasc --head "$_BRANCH" \
+          if ! gh pr create --base wasc --head "$_BRANCH" \
             --title "Sync upstream $_TAG" \
             --body "Merges upstream \`$_TAG\` (previous: \`$_CURRENT\`). $note
 
           The **verify** job builds the app for the simulator on this branch and lets Claude fix build breaks.
-          After merging, run *wasc release (TestFlight)*."
+          After merging, run *wasc release (TestFlight)*."; then
+            echo "::warning::Could not open the PR (set WASC_SYNC_TOKEN). Open it by hand: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/wasc...$_BRANCH"
+          fi
+
+  disable-after-sync:
+    # The pushed sync branch may carry new upstream workflows, which GitHub enables on arrival.
+    name: Disable upstream workflows (after sync)
+    needs: sync
+    if: needs.sync.outputs.branch != ''
+    permissions:
+      actions: write
+    uses: ./.github/workflows/wasc-guard.yml
 
   verify:
     name: Simulator build
@@ -290,8 +314,11 @@ jobs:
           _OK: ${{ steps.build.outputs.ok }}
         run: |
           set -euo pipefail
+          comment() {
+            gh pr comment "$_BRANCH" --body "$1" || echo "::warning::No PR for $_BRANCH: $1"
+          }
           if [ "$_OK" = "true" ]; then
-            gh pr comment "$_BRANCH" --body "Simulator build passed."
+            comment "Simulator build passed."
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -300,10 +327,10 @@ jobs:
           git checkout -- '*/Settings.bundle' 2>/dev/null || true
           git clean -fdq -- '*/Settings.bundle'
           if [ -z "$(git status --porcelain)" ]; then
-            gh pr comment "$_BRANCH" --body "Simulator build failed and Claude made no changes. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            comment "Simulator build failed and Claude made no changes. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             exit 1
           fi
           git add -A
           git commit -m "wasc: fix build after upstream sync"
           git push origin "HEAD:$_BRANCH"
-          gh pr comment "$_BRANCH" --body "Simulator build failed; Claude pushed a fix. Review it, and re-run the build if needed. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          comment "Simulator build failed; Claude pushed a fix. Review it, and re-run the build if needed. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
