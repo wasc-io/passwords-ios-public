@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- wasc passwords app icon (PLACEHOLDER). Lowercase bold geometric "w", white on full-bleed #111111.
+     Drawn as polygons (no font dependency). No rounded corners: iOS applies the mask.
+     Rendered to the 1024px app icons by wasc/brand/render-icons.sh. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="0" y="0" width="1024" height="1024" fill="#111111"/>
+  <g fill="#ffffff">
+    <polygon points="212,330 324,330 446,694 334,694"/>
+    <polygon points="334,694 446,694 568,330 456,330"/>
+    <polygon points="456,330 568,330 690,694 578,694"/>
+    <polygon points="578,694 690,694 812,330 700,330"/>
+  </g>
+</svg>
