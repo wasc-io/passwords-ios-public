@@ -91,7 +91,7 @@ Then create the App Store Connect app record "wasc passwords" for bundle `me.was
 ## CI
 
 Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release and stale check),
-`ANTHROPIC_API_KEY` (sync), and optionally `WASC_SYNC_TOKEN`. Variable: `WASC_EXPORT_COMPLIANCE_CODE`
+`ANTHROPIC_API_KEY` (sync), and `WASC_SYNC_TOKEN` (sync; needed to open PRs). Variable: `WASC_EXPORT_COMPLIANCE_CODE`
 (optional).
 
 - **wasc-release.yml** runs on `workflow_dispatch` or a pushed `wasc-v*` tag. It generates the
