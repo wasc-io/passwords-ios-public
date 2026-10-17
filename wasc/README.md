@@ -14,7 +14,7 @@ Keep it this small. Everything else, including the in-app "Bitwarden" strings, s
 | Change | Where |
 |---|---|
 | Identifiers, team, display name, `WASC_NO_CRASHLYTICS` flag | [`wasc-bwpm.xcconfig`](wasc-bwpm.xcconfig), included at the end of `Configs/Common-bwpm.xcconfig` |
-| Watch app display name uses `$(BMPW_BUNDLE_DISPLAY_NAME)` | `BitwardenWatchApp/Info.plist` |
+| Watch app, AutoFill extension (the name in iOS Settings > AutoFill) and notification extension display names use `$(BMPW_BUNDLE_DISPLAY_NAME)` | `BitwardenWatchApp/Info.plist`, `BitwardenAutoFillExtension/Application/Support/Info.plist`, `BitwardenNotificationExtension/Application/Support/Info.plist` |
 | Bitwarden's associated domains removed (`*.bitwarden.com` webcredentials/applinks) | `Bitwarden/Application/Support/Bitwarden.entitlements` |
 | Firebase/Crashlytics off (otherwise the placeholder `GoogleService-Info.plist` crashes Release at launch) | `Bitwarden/Application/Services/ErrorReporter/ErrorReporterFactory.swift`, `BitwardenWatchApp/ExtensionDelegate.swift` |
 | Default server `https://passwords.wasc.me` (`EnvironmentURLData.defaultWasc`, initial region `.selfHosted`); the region picker still offers bitwarden.com/.eu/other self-hosted servers | `BitwardenShared/Core/Platform/Models/Domain/EnvironmentURLData+Wasc.swift`, `BitwardenShared/Core/Platform/Services/EnvironmentService.swift`, `BitwardenShared/UI/Auth/Utilities/RegionHelper.swift` |
@@ -22,12 +22,14 @@ Keep it this small. Everything else, including the in-app "Bitwarden" strings, s
 | CI | `.github/workflows/wasc-release.yml`, `.github/workflows/wasc-sync.yml` |
 
 Override order of the xcconfigs: upstream `Common-bwpm.xcconfig` < `wasc/wasc-bwpm.xcconfig` <
-`Configs/Local-bwpm.xcconfig` (git-ignored; CI writes `DEVELOPMENT_TEAM` and `CODE_SIGN_STYLE` there).
+`Configs/Local-bwpm.xcconfig` (git-ignored; CI writes `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE = Automatic` and
+`CODE_SIGN_IDENTITY = Apple Distribution` there, the last one overriding the `Apple Development` that
+`Configs/Bitwarden-Release.xcconfig` sets). `wasc-bwpm.xcconfig` sets `DEVELOPMENT_TEAM = KQB68F43PW` for local builds.
 
 All bundle IDs, app groups and keychain groups are derived from `BASE_BUNDLE_ID = me.wasc.passwords`.
 
 Build-time changes made only in CI (not committed):
-- `aps-environment` = `production` (the passwords-push relay sends standard Bitwarden background
+- `aps-environment` = `production`, matching the distribution profile (the passwords-push relay sends standard Bitwarden background
   pushes to topic `me.wasc.passwords`; the notification extension and the `remote-notification`
   background mode stay as upstream has them).
 - Bitwarden's `ITSEncryptionExportComplianceCode` is removed from `Info.plist`. If the repo variable
@@ -35,12 +37,17 @@ Build-time changes made only in CI (not committed):
   stays `YES` as upstream has it, so without our own code each build needs the export compliance
   question answered in App Store Connect. The legal answer is the owner's call.
 - `MARKETING_VERSION` comes from `upstream-tag` (`v2026.10.0-bwpm` becomes `2026.10.0`), and
-  `CURRENT_PROJECT_VERSION` is the run number + 100 (it can be overridden on dispatch).
+  `CURRENT_PROJECT_VERSION` is run number * 10 + run attempt + 100, so re-runs get a new number (it
+  can be overridden on dispatch).
 
 Decisions (coordinator defaults, can be revisited): the watch app is **kept**, Bitwarden's
 associated domains are **dropped**, and the region picker is kept.
 
 Not changed, but worth knowing:
+- Dropping the associated domains only matters for the **cloud regions** (bitwarden.com / bitwarden.eu):
+  there, SSO and Duo lose their HTTPS (universal link) callbacks and WebAuthn/passkey 2FA does not work,
+  because both rely on Bitwarden's `*.bitwarden.com` associated domains. Self-hosted servers
+  (including passwords.wasc.me) use the `bitwarden://` callback and are unaffected.
 - The `bitwarden://` URL scheme (used for SSO/Duo/WebAuthn callbacks when self-hosted) and the
   `otpauth` scheme are the same as in the official app. If both apps are installed, iOS may route
   callbacks to either.
@@ -90,7 +97,10 @@ Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release a
 - **wasc-release.yml** runs on `workflow_dispatch` or a pushed `wasc-v*` tag. It generates the
   projects with XcodeGen, archives the `Bitwarden` scheme (Release) with **automatic signing**
   (`-allowProvisioningUpdates` plus the ASC API key), exports it for `app-store-connect` and uploads
-  it with `xcrun altool`. The `.ipa` is kept as an artifact for 14 days. Untick *upload* for a dry run.
+  it with `xcrun altool --apple-id <id>`. When uploading, it first looks up the numeric App Store
+  Connect app id for `me.wasc.passwords` through the ASC API (without `--apple-id`, altool on Xcode 26
+  can upload to the wrong app or fail silently) and fails before archiving if the app record is
+  missing. The `.ipa` is kept as an artifact for 14 days. Untick *upload* for a dry run.
   - It fails until the identifiers, app groups, iCloud container and app record above exist. That is
     expected.
   - The current API key (`ZZ8H45VBNS`) has the **Developer** role. Xcode can only reuse existing
@@ -101,12 +111,16 @@ Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release a
 - **wasc-sync.yml** runs daily. It does three things:
   - It disables every workflow that is not `wasc-*`. Upstream workflows need Bitwarden's Azure
     secrets, and new ones arrive with every merge.
-  - If the newest TestFlight build is 75+ days old, it dispatches `wasc-release.yml` (TestFlight
-    builds expire after 90 days).
+  - If at least one TestFlight build exists and the newest is 75+ days old, it dispatches
+    `wasc-release.yml` (TestFlight builds expire after 90 days). Before the first build it does
+    nothing; the first release is dispatched by hand.
   - If upstream has a newer `v*-bwpm` tag than `upstream-tag`, it merges that tag into
     `sync/<tag>`, lets Claude resolve any conflicts, bumps `upstream-tag` and opens a PR against
-    `wasc`. A macOS job then builds that branch for the simulator. If the build fails, Claude
-    attempts a fix and pushes it to the PR.
+    `wasc`. On conflicts, the fork's `Icon-1024.png` files are kept automatically before Claude runs.
+    A macOS job then builds that branch for the simulator. If the build fails, Claude attempts a fix
+    and pushes it to the PR (regenerated `Settings.bundle` acknowledgements are discarded first, so
+    they never end up in the fix commit).
+  - `anthropics/claude-code-action` is pinned to a commit SHA (v1.0.252); bump it by hand.
 
   Upstream merges usually change `.github/workflows/*`, and `GITHUB_TOKEN` may not push those. Set
   `WASC_SYNC_TOKEN` (a fine-grained PAT on this repo with Contents, Pull requests and Workflows write)
