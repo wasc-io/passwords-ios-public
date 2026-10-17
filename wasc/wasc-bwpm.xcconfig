@@ -2,8 +2,8 @@
 // Included at the end of Configs/Common-bwpm.xcconfig, so it wins over upstream
 // defaults while Configs/Local-bwpm.xcconfig (written by CI / developers) still wins over this.
 
-// Empty on purpose: CI writes the team into Configs/Local-bwpm.xcconfig from the APPLE_TEAM_ID secret.
-DEVELOPMENT_TEAM =
+// wasc's Apple team (not secret). CI still writes DEVELOPMENT_TEAM into Configs/Local-bwpm.xcconfig.
+DEVELOPMENT_TEAM = KQB68F43PW
 ORGANIZATION_IDENTIFIER = me.wasc
 BASE_BUNDLE_ID = me.wasc.passwords
 SHARED_APP_GROUP_IDENTIFIER = group.me.wasc.passwords.authenticator
