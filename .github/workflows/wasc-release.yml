@@ -1,0 +1,209 @@
+name: wasc release (TestFlight)
+
+# Builds the Bitwarden scheme with the wasc identifiers (wasc/wasc-bwpm.xcconfig),
+# signs it with Xcode automatic signing using the App Store Connect API key, and uploads
+# it to TestFlight. See wasc/README.md for the Apple-side prerequisites.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-number:
+        description: "CFBundleVersion override (default: run number + 100)"
+        type: string
+      upload:
+        description: "Upload to TestFlight (off = export the .ipa as an artifact only)"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "wasc-v*"
+
+concurrency:
+  group: wasc-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Archive and upload
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      MINT_PATH: .mint/lib
+      MINT_LINK_PATH: .mint/bin
+      _UPLOAD: ${{ github.event_name == 'push' || inputs.upload }}
+      _BUILD_NUMBER_INPUT: ${{ inputs.build-number }}
+      _APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      _ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      _ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      _EXPORT_COMPLIANCE_CODE: ${{ vars.WASC_EXPORT_COMPLIANCE_CODE }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check required secrets
+        run: |
+          missing=0
+          for name in _APPLE_TEAM_ID _ASC_KEY_ID _ASC_ISSUER_ID; do
+            if [ -z "${!name}" ]; then echo "::error::secret ${name#_} is not set"; missing=1; fi
+          done
+          exit "$missing"
+
+      - name: Optimize macOS Runner
+        uses: ./.github/actions/macos-runner-tuneup
+
+      - name: Read Xcode version
+        run: echo "_XCODE_VERSION=$(tr -d '[:space:]' < .xcode-version)" >> "$GITHUB_ENV"
+
+      - name: Set Xcode version
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: ${{ env._XCODE_VERSION }}
+
+      - name: Install Homebrew dependencies
+        run: brew install mint yq
+
+      - name: Cache Mint packages
+        id: mint-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mint
+          key: ${{ runner.os }}-mint-${{ hashFiles('**/Mintfile') }}
+          restore-keys: |
+            ${{ runner.os }}-mint-
+
+      - name: Install Mint packages
+        if: steps.mint-cache.outputs.cache-hit != 'true'
+        run: mint bootstrap
+
+      - name: Set up App Store Connect API key
+        env:
+          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/private_keys
+          chmod 700 ~/private_keys
+          key_path="$HOME/private_keys/AuthKey_${_ASC_KEY_ID}.p8"
+          printf '%s\n' "$_ASC_KEY_P8" > "$key_path"
+          chmod 600 "$key_path"
+          echo "_ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Configure version, signing and plists
+        run: |
+          set -euo pipefail
+          upstream_tag=$(tr -d '[:space:]' < wasc/upstream-tag)
+          version_name=${upstream_tag#v}
+          version_name=${version_name%-bwpm}
+          build_number=${_BUILD_NUMBER_INPUT:-$((GITHUB_RUN_NUMBER + 100))}
+          echo "Version $version_name ($build_number) from $upstream_tag"
+          echo "_VERSION_NAME=$version_name" >> "$GITHUB_ENV"
+          echo "_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+
+          yq -i ".settings.MARKETING_VERSION = \"$version_name\"" project-pm.yml
+          yq -i ".settings.CURRENT_PROJECT_VERSION = \"$build_number\"" project-pm.yml
+
+          # Local-bwpm.xcconfig is included after wasc/wasc-bwpm.xcconfig, so it wins.
+          cat > Configs/Local-bwpm.xcconfig <<EOF
+          DEVELOPMENT_TEAM = $_APPLE_TEAM_ID
+          CODE_SIGN_STYLE = Automatic
+          EOF
+
+          # Production APNs (the passwords-push relay sends to api.push.apple.com).
+          plutil -replace aps-environment -string production Bitwarden/Application/Support/Bitwarden.entitlements
+
+          # Bitwarden's own export compliance code must not be shipped. Ours is optional.
+          plutil -remove ITSEncryptionExportComplianceCode Bitwarden/Application/Support/Info.plist || true
+          if [ -n "$_EXPORT_COMPLIANCE_CODE" ]; then
+            plutil -replace ITSEncryptionExportComplianceCode -string "$_EXPORT_COMPLIANCE_CODE" Bitwarden/Application/Support/Info.plist
+          fi
+
+          plutil -lint Bitwarden/Application/Support/Bitwarden.entitlements Bitwarden/Application/Support/Info.plist
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>teamID</key>
+            <string>$_APPLE_TEAM_ID</string>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Generate Xcode projects
+        run: |
+          mint run xcodegen --spec project-bwk.yml
+          mint run xcodegen --spec project-pm.yml
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcrun xcodebuild archive \
+            -workspace Bitwarden.xcworkspace \
+            -scheme Bitwarden \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/Bitwarden.xcarchive \
+            -derivedDataPath build/DerivedData \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$_ASC_KEY_PATH" \
+            -authenticationKeyID "$_ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$_ASC_ISSUER_ID" \
+            -quiet
+
+      - name: Export .ipa
+        run: |
+          xcrun xcodebuild -exportArchive \
+            -archivePath build/Bitwarden.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$_ASC_KEY_PATH" \
+            -authenticationKeyID "$_ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$_ASC_ISSUER_ID"
+          ls -la build/export
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wasc-passwords-${{ env._VERSION_NAME }}-${{ env._BUILD_NUMBER }}
+          path: build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload to TestFlight
+        if: env._UPLOAD == 'true'
+        run: |
+          ipa=$(find build/export -maxdepth 1 -name '*.ipa' | head -n 1)
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$ipa" \
+            --apiKey "$_ASC_KEY_ID" \
+            --apiIssuer "$_ASC_ISSUER_ID"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### wasc passwords ${_VERSION_NAME:-?} (${_BUILD_NUMBER:-?})"
+            echo "- upstream: $(cat wasc/upstream-tag)"
+            echo "- uploaded to TestFlight: ${_UPLOAD}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up auth key
+        if: always()
+        run: rm -rf ~/private_keys
