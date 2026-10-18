@@ -7,10 +7,10 @@
       (created and regenerated outside CI, see wasc/README.md), installs it, appends the
       PROVISIONING_PROFILE_SPECIFIER* lines to the xcconfig and writes the ExportOptions.plist.
 
-Env: _ASC_KEY_ID, _ASC_ISSUER_ID, _ASC_KEY_P8, _APPLE_TEAM_ID; optional _DIST_CERT_SHA1 (every
-profile must contain that certificate).
+Env: _ASC_KEY_ID, _ASC_ISSUER_ID, _ASC_KEY_P8, _APPLE_TEAM_ID, and _DIST_CERT_SHA1 (every profile
+must contain that certificate; CI always sets it, it is optional only for local runs).
 """
-import base64, hashlib, json, os, plistlib, sys, time, urllib.parse, urllib.request
+import base64, hashlib, json, os, plistlib, sys, time, urllib.error, urllib.parse, urllib.request
 
 import jwt
 
@@ -27,7 +27,7 @@ TARGETS = {
     "me.wasc.passwords.watchkitapp": "PROVISIONING_PROFILE_SPECIFIER_WATCH_APP",
     "me.wasc.passwords.watchkitapp.widget-extension": "PROVISIONING_PROFILE_SPECIFIER_WATCH_WIDGET_EXTENSION",
 }
-# Xcode 16+ reads the first, older tools the second.
+# Xcode 16+ reads the first; the second is the legacy location, kept in case a tool still reads it.
 PROFILE_DIRS = ["~/Library/Developer/Xcode/UserData/Provisioning Profiles", "~/Library/MobileDevice/Provisioning Profiles"]
 
 
@@ -46,8 +46,11 @@ def get(path):
     )
     req = urllib.request.Request(path if path.startswith("https://") else API + path,
                                  headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req) as resp:
-        return json.load(resp)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:  # Apple's error JSON says why (role, agreement, filter)
+        fail(f"App Store Connect GET {path}: HTTP {e.code} {e.read().decode(errors='replace')[:500]}")
 
 
 def app_id(bundle_id):
@@ -87,7 +90,7 @@ def profiles(xcconfig, export_options):
     dirs = [os.path.expanduser(d) for d in PROFILE_DIRS]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
-    names, problems = {}, []
+    uuids, problems = {}, []
     for ident, p in sorted(newest.items()):
         content = base64.b64decode(get(f"/v1/profiles/{p['id']}?fields[profiles]=profileContent")
                                    ["data"]["attributes"]["profileContent"])
@@ -103,13 +106,13 @@ def profiles(xcconfig, export_options):
         for d in dirs:
             with open(os.path.join(d, f"{info['UUID']}.mobileprovision"), "wb") as f:
                 f.write(content)
-        names[ident] = info["Name"]
+        uuids[ident] = info["UUID"]  # unambiguous even if two profiles share a name
         print(f"{ident}: {info['Name']} ({info['UUID']}, expires {info['ExpirationDate']:%Y-%m-%d})")
     if problems:
         fail("; ".join(problems) + ". Fix in the portal and regenerate the profiles (wasc/README.md).")
 
     with open(xcconfig, "a") as f:
-        f.writelines(f"{TARGETS[ident]} = {name}\n" for ident, name in sorted(names.items()))
+        f.writelines(f"{TARGETS[ident]} = {uuid}\n" for ident, uuid in sorted(uuids.items()))
     with open(export_options, "wb") as f:
         plistlib.dump({
             "method": "app-store-connect",
@@ -117,7 +120,7 @@ def profiles(xcconfig, export_options):
             "signingStyle": "manual",
             "signingCertificate": "Apple Distribution",
             "teamID": os.environ["_APPLE_TEAM_ID"],
-            "provisioningProfiles": names,
+            "provisioningProfiles": uuids,
             "manageAppVersionAndBuildNumber": False,
             "uploadSymbols": False,
         }, f)
@@ -130,4 +133,5 @@ if __name__ == "__main__":
         case ["profiles", xcconfig, export_options]:
             profiles(xcconfig, export_options)
         case _:
-            fail(__doc__)
+            print(__doc__, file=sys.stderr)
+            raise SystemExit(2)

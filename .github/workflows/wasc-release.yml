@@ -86,8 +86,14 @@ jobs:
         if: steps.mint-cache.outputs.cache-hit != 'true'
         run: mint bootstrap
 
+      # wasc/ci/asc.py needs Python 3.10+; macOS's own python3 is older.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
       - name: Install Python dependencies
-        run: python3 -m pip install --user --quiet --break-system-packages "pyjwt[crypto]"
+        run: python -m pip install --quiet "pyjwt[crypto]"
 
       # altool on Xcode 26 can upload to the wrong app or fail silently without --apple-id,
       # so resolve the numeric App Store Connect app id up front (and fail before archiving).
@@ -95,10 +101,10 @@ jobs:
         if: env._UPLOAD == 'true'
         env:
           _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
-        run: python3 wasc/ci/asc.py app-id me.wasc.passwords
+        run: python wasc/ci/asc.py app-id me.wasc.passwords
 
-      # A throwaway keychain holding only the fork's dedicated Apple Distribution identity
-      # (not the certificate the other apps of the team sign with).
+      # A throwaway keychain holding only the fork's dedicated Apple Distribution identity. The key
+      # is non-extractable, so later build scripts cannot export it.
       - name: Install distribution certificate
         env:
           _DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
@@ -113,8 +119,7 @@ jobs:
           echo "_KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          security import "$p12" -k "$keychain" -f pkcs12 -P "$_DIST_CERT_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$_DIST_CERT_PASSWORD" -x -T /usr/bin/codesign
           rm -f "$p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
           # Put it first in the user search list, keeping the existing keychains.
@@ -172,7 +177,7 @@ jobs:
         env:
           _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
-          python3 wasc/ci/asc.py profiles Configs/Local-bwpm.xcconfig "$RUNNER_TEMP/ExportOptions.plist"
+          python wasc/ci/asc.py profiles Configs/Local-bwpm.xcconfig "$RUNNER_TEMP/ExportOptions.plist"
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
 
       - name: Generate Xcode projects
@@ -229,15 +234,7 @@ jobs:
       - name: Signing hint (failed)
         if: failure()
         run: |
-          {
-            echo "### Release failed"
-            echo
-            echo "If the log mentions a **certificate, provisioning profile, entitlement, app group or iCloud container**:"
-            echo
-            echo "1. A new target or capability needs its bundle ID, capabilities and portal assignments first (wasc/README.md, Apple prerequisites)."
-            echo "2. Then regenerate the \`wasc passwords AppStore *\` profiles for the fork's Apple Distribution certificate (agent-side \`scripts/asc/profiles.py\` with an admin key, not available to CI) and re-run this job."
-            echo "3. An expired or revoked certificate means a new one plus new \`DIST_CERT_P12_BASE64\` / \`DIST_CERT_PASSWORD\` secrets, then step 2."
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Signing errors (certificate, profile, entitlement, app group, iCloud container): see [wasc/README.md, Signing](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/wasc/README.md#signing). Usual fix: complete the portal assignments, regenerate the \`wasc passwords AppStore *\` profiles, re-run." >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=wasc release failed::For signing errors: fix bundle IDs/capabilities in the portal, regenerate the 'wasc passwords AppStore *' profiles, re-run (see job summary and wasc/README.md)."
 
       - name: Summary
