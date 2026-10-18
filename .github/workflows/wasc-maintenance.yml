@@ -4,7 +4,6 @@ name: wasc maintenance
 #   0. re-enables itself, so GitHub's 60-day inactivity rule never pauses the schedule,
 #   1. keeps every non-wasc workflow disabled (wasc-guard.yml; upstream workflows need Bitwarden's secrets),
 #   2. re-runs wasc-release.yml when the newest TestFlight build is about to expire.
-# The file keeps its old name (wasc-sync.yml) because the keepalive job enables it by file name.
 
 on:
   schedule:
@@ -28,10 +27,10 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Re-enable wasc-sync.yml
+      - name: Re-enable wasc-maintenance.yml
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/wasc-sync.yml/enable"
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/wasc-maintenance.yml/enable"
 
   disable-upstream-workflows:
     name: Disable upstream workflows
