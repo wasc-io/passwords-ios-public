@@ -95,8 +95,9 @@ thread (`wasc-passwords-monthly-sync-v1`, every 30 days) merges the newest upstr
 a `sync/<tag>` branch, resolves conflicts (keeping the fork's `Icon-1024.png` files), bumps
 `upstream-tag`, opens a PR into `wasc` (merge commit, never squash), runs wasc-guard.yml right after
 the push, fixes build breaks found by wasc-verify.yml, and dispatches wasc-release.yml after merging
-(once the App Store Connect app record exists). Upstream tags are fetched into `refs/upstream-tags/*`, never `refs/tags`, so they cannot collide
-with the fork's own `wasc-v*` release tags. No `ANTHROPIC_API_KEY` or `WASC_SYNC_TOKEN` is needed.
+(once the App Store Connect app record exists). Upstream tags are fetched into `refs/upstream-tags/*`,
+never `refs/tags`, so they cannot collide with the fork's own `wasc-v*` release tags. No
+`ANTHROPIC_API_KEY` or `WASC_SYNC_TOKEN` is needed.
 
 ## CI
 
@@ -141,8 +142,7 @@ Variable: `WASC_EXPORT_COMPLIANCE_CODE` (optional).
 Token permissions: every job declares its own `permissions:` (workflow-level is `{}` or
 `contents: read`). The repository default for `GITHUB_TOKEN` is **read**, and *Allow GitHub Actions to
 create and approve pull requests* is **off** (`can_approve_pull_request_reviews=false`; it is one
-setting for both). Decision: keep it off, so no workflow can open or approve a PR; sync PRs are opened by the scheduled
-task with Nicolai's `gh` auth.
+setting for both). Decision: keep it off, so no workflow can open or approve a PR; sync PRs are
+opened by the scheduled task with Nicolai's `gh` auth.
 
-After a sync PR is merged, the scheduled task runs *wasc release (TestFlight)*; when merging one by
-hand, run it yourself.
+When merging a sync PR by hand, run *wasc release (TestFlight)* yourself.
