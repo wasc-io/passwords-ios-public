@@ -19,7 +19,7 @@ Keep it this small. Everything else, including the in-app "Bitwarden" strings, s
 | Firebase/Crashlytics off (otherwise the placeholder `GoogleService-Info.plist` crashes Release at launch) | `Bitwarden/Application/Services/ErrorReporter/ErrorReporterFactory.swift`, `BitwardenWatchApp/ExtensionDelegate.swift` |
 | Default server `https://passwords.wasc.me` (`EnvironmentURLData.defaultWasc`, initial region `.selfHosted`); the region picker still offers bitwarden.com/.eu/other self-hosted servers | `BitwardenShared/Core/Platform/Models/Domain/EnvironmentURLData+Wasc.swift`, `BitwardenShared/Core/Platform/Services/EnvironmentService.swift`, `BitwardenShared/UI/Auth/Utilities/RegionHelper.swift` |
 | Placeholder icon (app + watch, 1024px) | [`brand/`](brand) (`render-icons.sh` needs ImageMagick 7) |
-| CI | `.github/workflows/wasc-release.yml`, `.github/workflows/wasc-sync.yml`, `.github/workflows/wasc-guard.yml`, [`ci/asc.py`](ci/asc.py) |
+| CI | `.github/workflows/wasc-release.yml`, `.github/workflows/wasc-maintenance.yml`, `.github/workflows/wasc-verify.yml`, `.github/workflows/wasc-guard.yml`, [`ci/asc.py`](ci/asc.py) |
 
 Override order of the xcconfigs: upstream `Common-bwpm.xcconfig` < `wasc/wasc-bwpm.xcconfig` <
 `Configs/Local-bwpm.xcconfig` (git-ignored; CI writes `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE = Manual`,
@@ -91,6 +91,27 @@ needed. Frameworks (`me.wasc.bitwarden-kit`, `me.wasc.bitwarden-resources`,
 
 Then create the App Store Connect app record "wasc passwords" for bundle `me.wasc.passwords`.
 
+## Upstream sync
+
+Upstream sync is **not** done by CI. A monthly T3 Code scheduled task in Nicolai's compose-services
+thread (`wasc-passwords-monthly-sync-v1`, every 30 days; see `list_scheduled_tasks`) does it:
+
+1. Fetch upstream tags into `refs/upstream-tags/*`, never `refs/tags`, so they cannot collide with
+   the fork's own `wasc-v*` release tags.
+2. Merge the newest `v*-bwpm` tag into a `sync/<tag>` branch, resolve conflicts (keep upstream's
+   code plus the patch above; always keep the fork's `Icon-1024.png` files) and bump
+   `wasc/upstream-tag`.
+3. Push the branch, run wasc-guard.yml right away, and open a PR into `wasc`.
+4. wasc-verify.yml builds the PR; the task fixes build breaks on the branch.
+5. If the build is green and the review is clean, the task merges (merge commit, never squash) and
+   dispatches wasc-release.yml (once the App Store Connect app record exists). Otherwise it leaves
+   the PR open for Nicolai.
+
+It pushes with Nicolai's `gh` auth, which needs the `workflow` scope because upstream merges change
+`.github/workflows/*`. That push triggers `on: push` workflows, so a brand-new upstream workflow can
+run once on the sync branch before the guard disables it; without Bitwarden's secrets it fails.
+No `ANTHROPIC_API_KEY` or `WASC_SYNC_TOKEN` is needed.
+
 ## Signing
 
 Manual signing, maintained outside CI:
@@ -113,8 +134,8 @@ Manual signing, maintained outside CI:
 ## CI
 
 Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release and stale check),
-`DIST_CERT_P12_BASE64`, `DIST_CERT_PASSWORD` (release), `ANTHROPIC_API_KEY` (sync), and
-`WASC_SYNC_TOKEN` (sync; needed to open PRs). Variable: `WASC_EXPORT_COMPLIANCE_CODE` (optional).
+`DIST_CERT_P12_BASE64`, `DIST_CERT_PASSWORD` (release). Variable: `WASC_EXPORT_COMPLIANCE_CODE`
+(optional).
 
 - **wasc-release.yml** runs on `workflow_dispatch` or a pushed `wasc-v*` tag. It generates the
   projects with XcodeGen, imports the distribution certificate into a temporary keychain, downloads
@@ -126,44 +147,30 @@ Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release a
   artifact for 14 days. Untick *upload* for a dry run.
   - It fails until the app group / iCloud assignments, the profiles made after them and the app record
     exist. That is expected. On failure, the job summary points to [Signing](#signing).
+- **wasc-verify.yml** builds the app for the simulator (`./Scripts/build.sh project-pm.yml Bitwarden
+  Simulator`) on every PR into `wasc` and on `workflow_dispatch`. It only builds and fails on errors;
+  it never pushes.
 - **wasc-guard.yml** disables every workflow whose file is not `wasc-*`. Upstream workflows need
   Bitwarden's Azure secrets, and new ones arrive (enabled) with every merge. It runs on every push to
-  `wasc` (so a merged sync PR is cleaned up at once), on `workflow_dispatch`, and is called by
-  wasc-sync.yml.
-- **wasc-sync.yml** runs daily. It does four things:
+  `wasc` (so a merged sync PR is cleaned up at once), on `workflow_dispatch`, and is called daily by
+  wasc-maintenance.yml.
+- **wasc-maintenance.yml** runs daily. It does three things:
   - It keeps its own schedule alive: GitHub disables scheduled workflows in public repos after 60 days
     without repository activity, and this schedule is what stops TestFlight builds from expiring. The
-    `keepalive` job calls `PUT /repos/{repo}/actions/workflows/wasc-sync.yml/enable` (needs
+    `keepalive` job calls `PUT /repos/{repo}/actions/workflows/wasc-maintenance.yml/enable` (needs
     `actions: write`), which resets the inactivity timer without commits. This is what
     `liskin/gh-workflow-keepalive` does; it is inlined rather than used as an action. GitHub does not
     document the reset explicitly, so if the workflow ever shows as disabled, re-enable it in the Actions
     tab (and check that the 75-day stale check still has time before the 90-day expiry).
-  - It runs wasc-guard.yml, and again after pushing a `sync/<tag>` branch. Pushes made with
-    `WASC_SYNC_TOKEN` trigger `on: push` workflows, so a brand-new upstream workflow can still start
-    once on the sync branch before the guard disables it; without Bitwarden's secrets it fails.
+  - It runs wasc-guard.yml.
   - If at least one TestFlight build exists and the newest is 75+ days old, it dispatches
     `wasc-release.yml` (TestFlight builds expire after 90 days). Before the first build it does
     nothing; the first release is dispatched by hand.
-  - If upstream has a newer `v*-bwpm` tag than `upstream-tag`, it merges that tag into
-    `sync/<tag>`, lets Claude resolve any conflicts, bumps `upstream-tag` and opens a PR against
-    `wasc`. Upstream tags are fetched into `refs/upstream-tags/*`, never `refs/tags`, so they cannot
-    collide with the fork's own `wasc-v*` release tags. On conflicts, the fork's `Icon-1024.png`
-    files are kept automatically before Claude runs.
-    A macOS job then builds that branch for the simulator. If the build fails, Claude attempts a fix
-    and pushes it to the PR (regenerated `Settings.bundle` acknowledgements are discarded first, so
-    they never end up in the fix commit).
-  - `anthropics/claude-code-action` is pinned to a commit SHA (v1.0.252); bump it by hand.
-
-  Upstream merges usually change `.github/workflows/*`, and `GITHUB_TOKEN` may not push those.
-  Opening the PR also needs `WASC_SYNC_TOKEN` (see below). Set it: a fine-grained PAT on this repo
-  with Contents, Pull requests and Workflows write. Without it, the branch push is rejected for
-  workflow changes, and if the push does go through, the job logs a compare link instead of a PR (the
-  verify job still runs and only warns that there is no PR to comment on).
 
 Token permissions: every job declares its own `permissions:` (workflow-level is `{}` or
 `contents: read`). The repository default for `GITHUB_TOKEN` is **read**, and *Allow GitHub Actions to
 create and approve pull requests* is **off** (`can_approve_pull_request_reviews=false`; it is one
-setting for both). Decision: keep it off, so neither the workflows nor the Claude steps (which get
-`github.token`) can approve a PR, and open sync PRs with `WASC_SYNC_TOKEN` instead.
+setting for both). Decision: keep it off, so no workflow can open or approve a PR; sync PRs are
+opened by the scheduled task with Nicolai's `gh` auth.
 
-After a sync PR is merged, run *wasc release (TestFlight)*.
+When Nicolai merges a sync PR by hand, run *wasc release (TestFlight)* afterwards.

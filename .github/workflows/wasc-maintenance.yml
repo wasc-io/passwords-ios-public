@@ -1,0 +1,102 @@
+name: wasc maintenance
+
+# Daily housekeeping (no upstream sync; that is a monthly T3 Code scheduled task, see wasc/README.md):
+#   0. re-enables itself, so GitHub's 60-day inactivity rule never pauses the schedule,
+#   1. keeps every non-wasc workflow disabled (wasc-guard.yml; upstream workflows need Bitwarden's secrets),
+#   2. re-runs wasc-release.yml when the newest TestFlight build is about to expire.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: wasc-maintenance
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  keepalive:
+    # GitHub disables scheduled workflows in public repos after 60 days without repository
+    # activity, and this schedule is what keeps TestFlight builds from expiring (90 days).
+    # Re-enabling an active workflow resets that timer; this is what liskin/gh-workflow-keepalive
+    # (v1.2.1, f72ff1a1) does, inlined here instead of pulling in another action. No commits.
+    name: Keep schedule alive
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable wasc-maintenance.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/wasc-maintenance.yml/enable"
+
+  disable-upstream-workflows:
+    name: Disable upstream workflows
+    permissions:
+      actions: write
+    uses: ./.github/workflows/wasc-guard.yml
+
+  stale-check:
+    name: TestFlight build freshness
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
+    env:
+      _ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      _ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      _BUNDLE_ID: me.wasc.passwords
+      _MAX_AGE_DAYS: "75"
+    steps:
+      - name: Install PyJWT
+        run: python3 -m pip install --user --quiet --break-system-packages "pyjwt[crypto]"
+
+      - name: Check age of newest build
+        id: check
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os, time, urllib.parse, urllib.request
+          import jwt
+
+          now = int(time.time())
+          token = jwt.encode(
+              {"iss": os.environ["_ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+              os.environ["_ASC_KEY_P8"],
+              algorithm="ES256",
+              headers={"kid": os.environ["_ASC_KEY_ID"], "typ": "JWT"},
+          )
+
+          def get(path, **params):
+              url = "https://api.appstoreconnect.apple.com" + path + "?" + urllib.parse.urlencode(params)
+              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+              with urllib.request.urlopen(req) as resp:
+                  return json.load(resp)
+
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          apps = get("/v1/apps", **{"filter[bundleId]": os.environ["_BUNDLE_ID"]})["data"]
+          if not apps:
+              print(f"::warning::No App Store Connect app for {os.environ['_BUNDLE_ID']} yet; skipping.")
+              out.write("stale=false\n")
+              raise SystemExit(0)
+          builds = get("/v1/builds", **{"filter[app]": apps[0]["id"], "sort": "-uploadedDate", "limit": "1"})["data"]
+          if not builds:
+              # Nothing to keep alive yet; the first build is dispatched by hand.
+              print("::warning::No builds uploaded yet; skipping.")
+              out.write("stale=false\n")
+              raise SystemExit(0)
+          uploaded = datetime.datetime.fromisoformat(builds[0]["attributes"]["uploadedDate"])
+          age = (datetime.datetime.now(datetime.timezone.utc) - uploaded).days
+          print(f"Newest build {builds[0]['attributes']['version']} uploaded {uploaded.isoformat()} ({age} days ago)")
+          out.write(f"stale={'true' if age >= int(os.environ['_MAX_AGE_DAYS']) else 'false'}\n")
+          EOF
+
+      - name: Trigger a fresh TestFlight build
+        if: steps.check.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "::warning::Newest TestFlight build is $_MAX_AGE_DAYS+ days old; dispatching wasc-release.yml"
+          gh workflow run wasc-release.yml -R "$GITHUB_REPOSITORY" --ref wasc

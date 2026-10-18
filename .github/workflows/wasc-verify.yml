@@ -1,0 +1,48 @@
+name: wasc verify
+
+# Simulator build of the Password Manager app. Runs on PRs into wasc (for example the monthly
+# upstream sync PRs) and on demand. It only builds and fails on errors. See wasc/README.md.
+
+on:
+  pull_request:
+    branches: [wasc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasc-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Simulator build
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      MINT_PATH: .mint/lib
+      MINT_LINK_PATH: .mint/bin
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read Xcode version
+        run: echo "_XCODE_VERSION=$(tr -d '[:space:]' < .xcode-version)" >> "$GITHUB_ENV"
+
+      - name: Set Xcode version
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: ${{ env._XCODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          brew install mint
+          mint bootstrap
+
+      - name: Build for simulator
+        run: ./Scripts/build.sh project-pm.yml Bitwarden Simulator
