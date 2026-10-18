@@ -19,12 +19,14 @@ Keep it this small. Everything else, including the in-app "Bitwarden" strings, s
 | Firebase/Crashlytics off (otherwise the placeholder `GoogleService-Info.plist` crashes Release at launch) | `Bitwarden/Application/Services/ErrorReporter/ErrorReporterFactory.swift`, `BitwardenWatchApp/ExtensionDelegate.swift` |
 | Default server `https://passwords.wasc.me` (`EnvironmentURLData.defaultWasc`, initial region `.selfHosted`); the region picker still offers bitwarden.com/.eu/other self-hosted servers | `BitwardenShared/Core/Platform/Models/Domain/EnvironmentURLData+Wasc.swift`, `BitwardenShared/Core/Platform/Services/EnvironmentService.swift`, `BitwardenShared/UI/Auth/Utilities/RegionHelper.swift` |
 | Placeholder icon (app + watch, 1024px) | [`brand/`](brand) (`render-icons.sh` needs ImageMagick 7) |
-| CI | `.github/workflows/wasc-release.yml`, `.github/workflows/wasc-sync.yml`, `.github/workflows/wasc-guard.yml` |
+| CI | `.github/workflows/wasc-release.yml`, `.github/workflows/wasc-sync.yml`, `.github/workflows/wasc-guard.yml`, [`ci/asc.py`](ci/asc.py) |
 
 Override order of the xcconfigs: upstream `Common-bwpm.xcconfig` < `wasc/wasc-bwpm.xcconfig` <
-`Configs/Local-bwpm.xcconfig` (git-ignored; CI writes `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE = Automatic` and
-`CODE_SIGN_IDENTITY = Apple Distribution` there, the last one overriding the `Apple Development` that
-`Configs/Bitwarden-Release.xcconfig` sets). `wasc-bwpm.xcconfig` sets `DEVELOPMENT_TEAM = KQB68F43PW` for local builds.
+`Configs/Local-bwpm.xcconfig` (git-ignored; CI writes `DEVELOPMENT_TEAM`, `CODE_SIGN_STYLE = Manual`,
+`CODE_SIGN_IDENTITY = Apple Distribution` and upstream's `PROVISIONING_PROFILE_SPECIFIER*` variables
+there; its `CODE_SIGN_IDENTITY` overrides the `Apple Development` from
+`Configs/Bitwarden-Release.xcconfig`). `wasc-bwpm.xcconfig` sets `DEVELOPMENT_TEAM = KQB68F43PW` for
+local builds.
 
 All bundle IDs, app groups and keychain groups are derived from `BASE_BUNDLE_ID = me.wasc.passwords`.
 
@@ -67,7 +69,8 @@ Upstream test workflows are disabled in this fork, so nothing runs them.
 
 ## Apple prerequisites (one-time, by the account holder)
 
-Identifiers (developer.apple.com > Certificates, Identifiers & Profiles):
+Identifiers (developer.apple.com > Certificates, Identifiers & Profiles). The app group and iCloud
+container **assignments** can only be made in the portal (the API cannot set them):
 
 | Bundle ID | Capabilities |
 |---|---|
@@ -88,26 +91,41 @@ needed. Frameworks (`me.wasc.bitwarden-kit`, `me.wasc.bitwarden-resources`,
 
 Then create the App Store Connect app record "wasc passwords" for bundle `me.wasc.passwords`.
 
+## Signing
+
+Manual signing, maintained outside CI:
+- **Certificate**: a dedicated **Apple Distribution** certificate for this fork only (`N7KY99B2YM`;
+  renew it before it expires), in the secrets `DIST_CERT_P12_BASE64` / `DIST_CERT_PASSWORD`. The
+  team's other apps sign with a different certificate, so a leak or revocation here does not affect
+  them. CI checks that every profile contains exactly this certificate.
+- **Profiles**: one App Store profile per bundle ID in the table above (7), for that certificate,
+  with a name starting with `wasc passwords AppStore ` (the rest is free; the maintainers' script uses
+  `<target> <UTC timestamp>`). CI takes the newest **ACTIVE** one per bundle ID, by creation date,
+  and refers to it by UUID. Apple invalidates profiles when an App ID's capabilities or assignments
+  change, so create new ones after every such change and after renewing the certificate; old ones can
+  stay. CI fails early if a profile is missing, lacks the certificate, or has an app group / iCloud
+  container capability with nothing assigned.
+- **Who creates them**: the CI key (`ZZ8H45VBNS`) has the **Developer** role on purpose. It can upload
+  builds and read profiles, but cannot create certificates, identifiers or profiles. Do not put an
+  Admin key into this public repo's secrets; create profiles in the portal or with an admin key
+  elsewhere.
+
 ## CI
 
 Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release and stale check),
-`ANTHROPIC_API_KEY` (sync), and `WASC_SYNC_TOKEN` (sync; needed to open PRs). Variable: `WASC_EXPORT_COMPLIANCE_CODE`
-(optional).
+`DIST_CERT_P12_BASE64`, `DIST_CERT_PASSWORD` (release), `ANTHROPIC_API_KEY` (sync), and
+`WASC_SYNC_TOKEN` (sync; needed to open PRs). Variable: `WASC_EXPORT_COMPLIANCE_CODE` (optional).
 
 - **wasc-release.yml** runs on `workflow_dispatch` or a pushed `wasc-v*` tag. It generates the
-  projects with XcodeGen, archives the `Bitwarden` scheme (Release) with **automatic signing**
-  (`-allowProvisioningUpdates` plus the ASC API key), exports it for `app-store-connect` and uploads
-  it with `xcrun altool --apple-id <id>`. When uploading, it first looks up the numeric App Store
-  Connect app id for `me.wasc.passwords` through the ASC API (without `--apple-id`, altool on Xcode 26
-  can upload to the wrong app or fail silently) and fails before archiving if the app record is
-  missing. The `.ipa` is kept as an artifact for 14 days. Untick *upload* for a dry run.
-  - It fails until the identifiers, app groups, iCloud container and app record above exist. That is
-    expected.
-  - The current API key (`ZZ8H45VBNS`) has the **Developer** role. Xcode can only reuse existing
-    identifiers with it. Cloud-managed signing also needs access to the cloud-managed
-    distribution/development certificates, which normally means an **Admin** key. If archive or export
-    fails with a certificate or profile permission error after the identifiers exist, create an Admin
-    API key and replace the `ASC_*` secrets.
+  projects with XcodeGen, imports the distribution certificate into a temporary keychain, downloads
+  the profiles (see [Signing](#signing)), archives the `Bitwarden` scheme (Release) with **manual
+  signing**, exports it for `app-store-connect` and uploads it with `xcrun altool --apple-id <id>`.
+  When uploading, it first looks up the numeric App Store Connect app id for `me.wasc.passwords`
+  through the ASC API (without `--apple-id`, altool on Xcode 26 can upload to the wrong app or fail
+  silently) and fails before archiving if the app record is missing. The `.ipa` is kept as an
+  artifact for 14 days. Untick *upload* for a dry run.
+  - It fails until the app group / iCloud assignments, the profiles made after them and the app record
+    exist. That is expected. On failure, the job summary points to [Signing](#signing).
 - **wasc-guard.yml** disables every workflow whose file is not `wasc-*`. Upstream workflows need
   Bitwarden's Azure secrets, and new ones arrive (enabled) with every merge. It runs on every push to
   `wasc` (so a merged sync PR is cleaned up at once), on `workflow_dispatch`, and is called by
