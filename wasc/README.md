@@ -113,10 +113,10 @@ Secrets: `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (release a
 - **wasc-release.yml** runs on `workflow_dispatch` or a pushed `wasc-v*` tag. It generates the
   projects with XcodeGen, imports the distribution certificate into a temporary keychain, downloads
   the profiles (see [Signing](#signing)), archives the `Bitwarden` scheme (Release) with **manual
-  signing**, exports it for `app-store-connect` and uploads it with `xcrun altool --apple-id <id>`. When uploading, it first looks up the numeric App Store
-  Connect app id for `me.wasc.passwords` through the ASC API (without `--apple-id`, altool on Xcode 26
-  can upload to the wrong app or fail silently) and fails before archiving if the app record is
-  missing. The `.ipa` is kept as an artifact for 14 days. Untick *upload* for a dry run.
+  signing**, exports it for `app-store-connect` and uploads it with `xcrun altool --apple-id <id>`.
+  When uploading, it first looks up the numeric App Store Connect app id for `me.wasc.passwords`
+  through the ASC API (without `--apple-id`, altool on Xcode 26 can upload to the wrong app or fail
+  silently) and fails before archiving if the app record is missing. The `.ipa` is kept as an artifact for 14 days. Untick *upload* for a dry run.
   - It fails until the app group / iCloud assignments, the profiles made after them and the app record
     exist. That is expected. On failure, the job summary lists the usual signing fixes.
   - The API key (`ZZ8H45VBNS`) has the **Developer** role on purpose: it can upload builds and read

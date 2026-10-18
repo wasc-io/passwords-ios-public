@@ -55,9 +55,10 @@ def app_id(bundle_id):
             if a["attributes"]["bundleId"] == bundle_id]
     if not apps:
         fail(f"No App Store Connect app record for {bundle_id}. Create it first (see wasc/README.md).")
-    print(f"App Store Connect app {apps[0]['attributes']['name']} has id {apps[0]['id']}")
+    app = apps[0]
+    print(f"App Store Connect app {app['attributes']['name']} has id {app['id']}")
     with open(os.environ["GITHUB_ENV"], "a") as env:
-        env.write(f"_ASC_APP_ID={apps[0]['id']}\n")
+        env.write(f"_ASC_APP_ID={app['id']}\n")
 
 
 def newest_profiles():

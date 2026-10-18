@@ -215,9 +215,7 @@ jobs:
         run: |
           set -euo pipefail
           # altool reads the key from ~/private_keys/AuthKey_<id>.p8.
-          mkdir -p ~/private_keys
-          chmod 700 ~/private_keys
-          (umask 077 && printf '%s\n' "$_ASC_KEY_P8" > ~/private_keys/AuthKey_"$_ASC_KEY_ID".p8)
+          (umask 077 && mkdir -p ~/private_keys && printf '%s\n' "$_ASC_KEY_P8" > ~/private_keys/AuthKey_"$_ASC_KEY_ID".p8)
           ipa=$(find build/export -maxdepth 1 -name '*.ipa' | head -n 1)
           xcrun altool --upload-app \
             --type ios \
