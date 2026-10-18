@@ -1,8 +1,8 @@
 name: wasc release (TestFlight)
 
-# Builds the Bitwarden scheme with the wasc identifiers (wasc/wasc-bwpm.xcconfig),
-# signs it with Xcode automatic signing using the App Store Connect API key, and uploads
-# it to TestFlight. See wasc/README.md for the Apple-side prerequisites.
+# Builds the Bitwarden scheme with the wasc identifiers (wasc/wasc-bwpm.xcconfig), signs it
+# manually with the fork's own Apple Distribution certificate and the App Store profiles from
+# App Store Connect, and uploads it to TestFlight. See wasc/README.md for the Apple-side setup.
 
 on:
   workflow_dispatch:
@@ -48,9 +48,13 @@ jobs:
           persist-credentials: false
 
       - name: Check required secrets
+        env:
+          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          _DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          _DIST_CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
         run: |
           missing=0
-          for name in _APPLE_TEAM_ID _ASC_KEY_ID _ASC_ISSUER_ID; do
+          for name in _APPLE_TEAM_ID _ASC_KEY_ID _ASC_ISSUER_ID _ASC_KEY_P8 _DIST_CERT_P12_BASE64 _DIST_CERT_PASSWORD; do
             if [ -z "${!name}" ]; then echo "::error::secret ${name#_} is not set"; missing=1; fi
           done
           exit "$missing"
@@ -82,16 +86,8 @@ jobs:
         if: steps.mint-cache.outputs.cache-hit != 'true'
         run: mint bootstrap
 
-      - name: Set up App Store Connect API key
-        env:
-          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
-        run: |
-          mkdir -p ~/private_keys
-          chmod 700 ~/private_keys
-          key_path="$HOME/private_keys/AuthKey_${_ASC_KEY_ID}.p8"
-          printf '%s\n' "$_ASC_KEY_P8" > "$key_path"
-          chmod 600 "$key_path"
-          echo "_ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+      - name: Install Python dependencies
+        run: python3 -m pip install --user --quiet --break-system-packages "pyjwt[crypto]"
 
       # altool on Xcode 26 can upload to the wrong app or fail silently without --apple-id,
       # so resolve the numeric App Store Connect app id up front (and fail before archiving).
@@ -99,33 +95,39 @@ jobs:
         if: env._UPLOAD == 'true'
         env:
           _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
-          _BUNDLE_ID: me.wasc.passwords
+        run: python3 wasc/ci/asc.py app-id me.wasc.passwords
+
+      # A throwaway keychain holding only the fork's dedicated Apple Distribution identity
+      # (not the certificate the other apps of the team sign with).
+      - name: Install distribution certificate
+        env:
+          _DIST_CERT_P12_BASE64: ${{ secrets.DIST_CERT_P12_BASE64 }}
+          _DIST_CERT_PASSWORD: ${{ secrets.DIST_CERT_PASSWORD }}
         run: |
           set -euo pipefail
-          python3 -m pip install --user --quiet --break-system-packages "pyjwt[crypto]"
-          python3 - <<'EOF'
-          import json, os, time, urllib.parse, urllib.request
-          import jwt
-
-          now = int(time.time())
-          token = jwt.encode(
-              {"iss": os.environ["_ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
-              os.environ["_ASC_KEY_P8"],
-              algorithm="ES256",
-              headers={"kid": os.environ["_ASC_KEY_ID"], "typ": "JWT"},
-          )
-          bundle_id = os.environ["_BUNDLE_ID"]
-          url = "https://api.appstoreconnect.apple.com/v1/apps?" + urllib.parse.urlencode({"filter[bundleId]": bundle_id})
-          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-          with urllib.request.urlopen(req) as resp:
-              apps = [a for a in json.load(resp)["data"] if a["attributes"]["bundleId"] == bundle_id]
-          if not apps:
-              print(f"::error::No App Store Connect app record for {bundle_id}. Create it first (see wasc/README.md).")
-              raise SystemExit(1)
-          print(f"App Store Connect app {apps[0]['attributes']['name']} has id {apps[0]['id']}")
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write(f"_ASC_APP_ID={apps[0]['id']}\n")
-          EOF
+          keychain="$RUNNER_TEMP/wasc-signing.keychain-db"
+          keychain_password=$(openssl rand -hex 32)
+          p12="$RUNNER_TEMP/dist.p12"
+          printf '%s' "$_DIST_CERT_P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          echo "_KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$_DIST_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          # Put it first in the user search list, keeping the existing keychains.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Apple Distribution: /{print $2; exit}')
+          if [ -z "$identity" ]; then
+            security find-identity -p codesigning "$keychain"
+            echo "::error::DIST_CERT_P12_BASE64 holds no valid Apple Distribution identity"
+            exit 1
+          fi
+          echo "Signing identity $identity"
+          echo "_DIST_CERT_SHA1=$identity" >> "$GITHUB_ENV"
 
       - name: Configure version, signing and plists
         run: |
@@ -145,9 +147,10 @@ jobs:
           # Local-bwpm.xcconfig is included after wasc/wasc-bwpm.xcconfig and after the
           # CODE_SIGN_IDENTITY = Apple Development line of Configs/Bitwarden-Release.xcconfig,
           # so it wins: the archive is signed for distribution.
+          # The provisioning profile lines are appended by the next step.
           cat > Configs/Local-bwpm.xcconfig <<EOF
           DEVELOPMENT_TEAM = $_APPLE_TEAM_ID
-          CODE_SIGN_STYLE = Automatic
+          CODE_SIGN_STYLE = Manual
           CODE_SIGN_IDENTITY = Apple Distribution
           EOF
 
@@ -163,26 +166,13 @@ jobs:
 
           plutil -lint Bitwarden/Application/Support/Bitwarden.entitlements Bitwarden/Application/Support/Info.plist
 
-          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>app-store-connect</string>
-            <key>destination</key>
-            <string>export</string>
-            <key>signingStyle</key>
-            <string>automatic</string>
-            <key>teamID</key>
-            <string>$_APPLE_TEAM_ID</string>
-            <key>manageAppVersionAndBuildNumber</key>
-            <false/>
-            <key>uploadSymbols</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
+      # Profiles are created (and regenerated after capability changes) outside CI with an admin
+      # key; this read-only step picks the newest ACTIVE one per target. See wasc/README.md.
+      - name: Install provisioning profiles
+        env:
+          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          python3 wasc/ci/asc.py profiles Configs/Local-bwpm.xcconfig "$RUNNER_TEMP/ExportOptions.plist"
           plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
 
       - name: Generate Xcode projects
@@ -200,10 +190,6 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath build/Bitwarden.xcarchive \
             -derivedDataPath build/DerivedData \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$_ASC_KEY_PATH" \
-            -authenticationKeyID "$_ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$_ASC_ISSUER_ID" \
             -quiet
 
       - name: Export .ipa
@@ -211,11 +197,7 @@ jobs:
           xcrun xcodebuild -exportArchive \
             -archivePath build/Bitwarden.xcarchive \
             -exportPath build/export \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$_ASC_KEY_PATH" \
-            -authenticationKeyID "$_ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$_ASC_ISSUER_ID"
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
           ls -la build/export
 
       - name: Upload .ipa artifact
@@ -228,8 +210,14 @@ jobs:
 
       - name: Upload to TestFlight
         if: env._UPLOAD == 'true'
+        env:
+          _ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
         run: |
           set -euo pipefail
+          # altool reads the key from ~/private_keys/AuthKey_<id>.p8.
+          mkdir -p ~/private_keys
+          chmod 700 ~/private_keys
+          (umask 077 && printf '%s\n' "$_ASC_KEY_P8" > ~/private_keys/AuthKey_"$_ASC_KEY_ID".p8)
           ipa=$(find build/export -maxdepth 1 -name '*.ipa' | head -n 1)
           xcrun altool --upload-app \
             --type ios \
@@ -237,6 +225,22 @@ jobs:
             --apple-id "$_ASC_APP_ID" \
             --apiKey "$_ASC_KEY_ID" \
             --apiIssuer "$_ASC_ISSUER_ID"
+
+      # CI cannot repair signing itself: its API key has the Developer role, and profiles are
+      # created outside CI. Turn the usual cryptic codesign errors into the fix.
+      - name: Signing hint (failed)
+        if: failure()
+        run: |
+          {
+            echo "### Release failed"
+            echo
+            echo "If the log mentions a **certificate, provisioning profile, entitlement, app group or iCloud container**:"
+            echo
+            echo "1. A new target or capability needs its bundle ID, capabilities and portal assignments first (wasc/README.md, Apple prerequisites)."
+            echo "2. Then regenerate the \`wasc passwords AppStore *\` profiles for the fork's Apple Distribution certificate (agent-side \`scripts/asc/profiles.py\` with an admin key, not available to CI) and re-run this job."
+            echo "3. An expired or revoked certificate means a new one plus new \`DIST_CERT_P12_BASE64\` / \`DIST_CERT_PASSWORD\` secrets, then step 2."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=wasc release failed::For signing errors: fix bundle IDs/capabilities in the portal, regenerate the 'wasc passwords AppStore *' profiles, re-run (see job summary and wasc/README.md)."
 
       - name: Summary
         if: always()
@@ -247,6 +251,8 @@ jobs:
             echo "- uploaded to TestFlight: ${_UPLOAD}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Clean up auth key
+      - name: Clean up signing material
         if: always()
-        run: rm -rf ~/private_keys
+        run: |
+          rm -rf ~/private_keys
+          if [ -n "${_KEYCHAIN_PATH:-}" ]; then security delete-keychain "$_KEYCHAIN_PATH" || true; fi
